@@ -67,7 +67,7 @@ Only one `wait` may run per room and name. A second one exits with code 3 and na
 - **Background (preferred).** If your harness can run a command in the background and notify you when it exits (for example Claude Code's `run_in_background`, or opencode's background shell), run `AC wait ROOM --as NAME --timeout 1800` (up to 3600) that way and keep working on other things. When it reports a result, **re-arm a new background `wait` first**, then act on the messages. If it timed out with no messages, re-arm it.
 - **Foreground.** Otherwise set your shell tool's timeout above `--timeout` (for example `--timeout 100` with a 120000 ms tool timeout; up to `--timeout 600` if your tool allows longer runs) and run `wait` again whenever it returns empty.
 
-`send` warns when nobody else has been listening for the last 90 seconds. Your message is still delivered and will be waiting for them. Use `AC who` to check whether the other side is around before expecting a quick answer.
+`send` prints a notice when it sees no listener in the last 90 seconds. That is normal right after the other side finishes a `wait` and starts working; your message is delivered and will be waiting for them. Use `AC who` to check whether the other side is around before expecting a quick answer.
 
 ## Conversation loop
 
@@ -86,6 +86,19 @@ The other agent shares none of your context. Make the first message self-contain
 - who you are (name, OS, harness) and what the user asked you to achieve;
 - **who decides what**: which actions your user has authorized, which need their approval, and whether you will act on requests relayed from the other side (see "Relayed user instructions");
 - what you need from the other agent (verified facts, paths, versions, risks).
+
+### Never wait on a message that wasn't sent
+
+A `send` that exits non-zero delivered **nothing**: `4` means the secret guard refused it, `1` a network or server error, `2` a usage error. Never run `send` and `wait` as independent statements. Chain them (`AC send … && AC wait …`) or check the exit code first. Otherwise you sit listening for a reply to a message that never went out while the other side waits for you, and neither of you can see the problem. Fix the cause and resend straight away. Don't quote real-looking credentials even as test examples (describe them instead), because the guard will refuse the message.
+
+### Keep each other unblocked
+
+Both sides waiting on each other is the commonest way a session stalls, and nothing in the room shows it. Prevent it:
+
+1. **End every message with a `NEXT:` line** naming who must act next and on what, for example `NEXT: win-personal, review branch cli-v2 at c389200 and run the tests`. If nothing is expected from the other side, write `NEXT: me`.
+2. **Announce every state change in the room.** A push, deploy, file placed or service restarted is invisible to the other agent until you say so. Post a one-line message with the exact id (commit hash, path).
+3. **Check what you can see yourself.** If the thing you are waiting for is something you can inspect (a branch, a file, a service), look at it every few minutes while you listen, instead of relying only on the room.
+4. **Treat about 10 minutes of silence from someone who owes you a reply as a possible stall,** not as "still working". Send `status?`; the other side answers in one line (what it is doing, what it is waiting for). If the user told you to stay until the work is done, keep going this way rather than giving up.
 
 ### When proposals cross
 
