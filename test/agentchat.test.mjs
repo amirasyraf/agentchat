@@ -4,11 +4,11 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, dirname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cli = join(root, "catalog", "agentchat", "scripts", "agentchat.mjs");
@@ -155,7 +155,7 @@ test("[DONE] is announced and history shows everyone", live, async () => {
   const sent = await run(["send", room, "[DONE] all finished", "--as", "test-a"]);
   assert.equal(sent.code, 0, sent.stderr);
   const got = await run(["wait", room, "--as", "test-b", "--timeout", "10"]);
-  assert.match(got.stdout, /test-a ended the conversation with \[DONE\]/);
+  assert.match(got.stdout, /test-a sent \[DONE\] \(nothing more from them\)/);
 
   const history = await run(["history", room, "--as", "test-a"]);
   assert.equal(history.code, 0, history.stderr);
@@ -168,4 +168,123 @@ test("empty messages are refused", live, async () => {
   const res = await run(["send", room, "-", "--as", "test-a"], { input: "  \n" });
   assert.equal(res.code, 2);
   assert.match(res.stderr, /empty message/);
+});
+
+// The tests below use a second room so their message counts don't depend on the ones above.
+const room2 = `test-${randomBytes(4).toString("hex")}`;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("room ids are capped so the presence topic fits ntfy's limit", async () => {
+  assert.equal((await run(["new", "r".repeat(45)])).code, 0);
+  assert.equal((await run(["new", "r".repeat(46)])).code, 2);
+});
+
+test("the secret guard refuses credentials without echoing them", async () => {
+  const env = { AGENTCHAT_TOKEN: "tk_guardtesttokenguardtesttoken00" };
+  const cases = [
+    ["aws key AKIAABCDEFGHIJKLMNOP here", /AWS access key id/],
+    ["key sk-ant-abcdefghijklmnopqrstuvwxyz0123", /sk- API key/],
+    ["OPENAI_API_KEY=abcdefghijklmnopqrstuvwx", /credential assignment/],
+    ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345", /Bearer credential/],
+    ["-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n", /private key block/],
+    ["my token is tk_guardtesttokenguardtesttoken00", /this machine's ntfy token/],
+  ];
+  for (const [text, rule] of cases) {
+    const res = await run(["send", room2, "--stdin", "--as", "test-a"], { env, input: text });
+    assert.equal(res.code, 4, `${text}: ${res.stdout}${res.stderr}`);
+    assert.match(res.stderr, rule);
+    assert.ok(!res.stderr.includes("ABCDEFGHIJKLMNOP") && !res.stderr.includes("abcdefghijklmnop"), "value leaked");
+  }
+  const file = join(tmp, "creds.txt");
+  writeFileSync(file, "aws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY\n");
+  const attach = await run(["send", room2, "--attach", file, "--as", "test-a"], { env });
+  assert.equal(attach.code, 4);
+  assert.match(attach.stderr, /attachment creds\.txt/);
+});
+
+test("placeholders and ordinary text pass the secret guard", live, async () => {
+  const text = "OPENAI_API_KEY=<redacted>\nTAVILY_API_KEY=${TAVILY_API_KEY}\nrun the task-runner sk-short\n";
+  const res = await run(["send", room2, "--stdin", "--as", "test-a"], { input: text });
+  assert.equal(res.code, 0, res.stderr);
+  const forced = await run(["send", room2, "AKIAABCDEFGHIJKLMNOP is a documented example", "--allow-secrets", "--as", "test-a"]);
+  assert.equal(forced.code, 0, forced.stderr);
+});
+
+test("send warns when nobody else is listening", live, async () => {
+  const res = await run(["send", room2, "anyone there?", "--as", "test-a"]);
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /nobody else is listening/);
+});
+
+test("only one wait per room and name; the lock is released afterwards", live, async () => {
+  await run(["wait", room2, "--as", "test-lock", "--timeout", "1"]);
+  const first = run(["wait", room2, "--as", "test-lock", "--timeout", "30"]);
+  await sleep(2500);
+  const second = await run(["wait", room2, "--as", "test-lock", "--timeout", "2"]);
+  assert.equal(second.code, 3, second.stdout + second.stderr);
+  assert.match(second.stderr, /already running \(pid \d+/);
+
+  const who = await run(["who", room2, "--as", "test-a"]);
+  assert.match(who.stdout, /^test-lock: listening/m);
+  const send = await run(["send", room2, "wake up", "--as", "test-a"]);
+  assert.doesNotMatch(send.stdout, /nobody else is listening/);
+
+  const done = await first;
+  assert.equal(done.code, 0, done.stderr);
+  assert.match(done.stdout, /^wake up$/m);
+  const again = await run(["wait", room2, "--as", "test-lock", "--timeout", "1"]);
+  assert.equal(again.code, 0, again.stderr);
+});
+
+test("a stale lock from a dead process is taken over", live, async () => {
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(join(tmp, "state", `${room2}.test-stale.lock`), JSON.stringify({ pid: 2 ** 22 + 12345, started: "x" }));
+  const res = await run(["wait", room2, "--as", "test-stale", "--timeout", "1"]);
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(!existsSync(join(tmp, "state", `${room2}.test-stale.lock`)), "lock not released");
+});
+
+test("peek shows unread messages without marking them read", live, async () => {
+  await run(["wait", room2, "--as", "test-peek", "--timeout", "1"]);
+  assert.equal((await run(["send", room2, "peek at me", "--as", "test-a"])).code, 0);
+  const peek = await run(["wait", room2, "--peek", "--as", "test-peek"]);
+  assert.equal(peek.code, 0, peek.stderr);
+  assert.match(peek.stdout, /^peek at me$/m);
+  assert.match(peek.stdout, /still unread/);
+  const read = await run(["wait", room2, "--as", "test-peek", "--timeout", "5"]);
+  assert.match(read.stdout, /^peek at me$/m);
+  const empty = await run(["wait", room2, "--peek", "--as", "test-peek"]);
+  assert.match(empty.stdout, /no unread messages/);
+});
+
+test("files are attached, listed without their contents, and fetched to disk", live, async () => {
+  await run(["wait", room2, "--as", "test-files", "--timeout", "1"]);
+  const data = randomBytes(20_000);
+  const file = join(tmp, "blob.bin");
+  writeFileSync(file, data);
+  const sent = await run(["send", room2, "--attach", file, "here is the blob", "--as", "test-a"]);
+  assert.equal(sent.code, 0, sent.stderr);
+  const id = sent.stdout.match(/id: (\w+)/)[1];
+
+  const got = await run(["wait", room2, "--as", "test-files", "--timeout", "10"]);
+  assert.equal(got.code, 0, got.stderr);
+  assert.match(got.stdout, /^here is the blob$/m);
+  assert.match(got.stdout, new RegExp(`\\[file: blob\\.bin, 20000 bytes, id ${id}`));
+  assert.ok(got.stdout.length < 2000, "file contents were printed");
+
+  const out = join(tmp, "fetched.bin");
+  const fetched = await run(["fetch", room2, id, "--out", out, "--as", "test-files"]);
+  assert.equal(fetched.code, 0, fetched.stderr);
+  assert.ok(readFileSync(out).equals(data), "fetched bytes differ");
+  assert.match(fetched.stdout, new RegExp(createHash("sha256").update(data).digest("hex")));
+  assert.equal((await run(["fetch", room2, id, "--out", out, "--as", "test-files"])).code, 2);
+  assert.equal((await run(["fetch", room2, id, "--out", out, "--force", "--as", "test-files"])).code, 0);
+});
+
+test("history --last shows only the newest messages", live, async () => {
+  const res = await run(["history", room2, "--last", "2", "--as", "test-a"]);
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(res.stdout.match(/=== end ===/g).length, 2);
+  assert.match(res.stdout, /showing the last 2 of \d+ cached messages/);
+  assert.equal((await run(["history", room2, "--last", "0"], { env: { AGENTCHAT_TOKEN: "x" } })).code, 2);
 });
