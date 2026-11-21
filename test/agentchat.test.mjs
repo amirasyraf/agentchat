@@ -30,10 +30,10 @@ const baseEnv = { ...process.env, AGENTCHAT_STATE_DIR: join(tmp, "state") };
 delete baseEnv.AGENTCHAT_NAME;
 if (token) baseEnv.AGENTCHAT_TOKEN = token;
 
-function run(args, { env = {}, input = "", timeout = 60_000 } = {}) {
+function run(args, { env = {}, input = "", timeout = 60_000, cwd } = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const child = spawn(process.execPath, [cli, ...args], { env: { ...baseEnv, ...env } });
+    const child = spawn(process.execPath, [cli, ...args], { env: { ...baseEnv, ...env }, cwd });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (data) => (stdout += data));
@@ -188,6 +188,7 @@ test("the secret guard refuses credentials without echoing them", async () => {
     ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345", /Bearer credential/],
     ["header\n\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n", /private key block on line 3/],
     ["my token is tk_guardtesttokenguardtesttoken00", /this machine's ntfy token/],
+    ["TOKEN_URL=https://user:hunter2pass@example.com/api", /credential assignment/],
   ];
   for (const [text, rule] of cases) {
     const res = await run(["send", room2, "--stdin", "--as", "test-a"], { env, input: text });
@@ -202,8 +203,18 @@ test("the secret guard refuses credentials without echoing them", async () => {
   assert.match(attach.stderr, /attachment creds\.txt/);
 });
 
-test("placeholders and ordinary text pass the secret guard", live, async () => {
-  const text = "OPENAI_API_KEY=<redacted>\nTAVILY_API_KEY=${TAVILY_API_KEY}\nrun the task-runner sk-short\n";
+test("placeholders, locations and ordinary text pass the secret guard", live, async () => {
+  const text = [
+    "OPENAI_API_KEY=<redacted>",
+    "TAVILY_API_KEY=${TAVILY_API_KEY}",
+    "run the task-runner sk-short",
+    "AGENTCHAT_SECRETS_FILE=/home/amirasyraf/stuff.secrets",
+    "export GITHUB_TOKEN_PATH=~/.config/gh/hosts.yml",
+    "AWS_SECRET_FILE: /etc/ppsplh/wp-app-password.txt",
+    "TOKEN_URL=https://login.microsoftonline.com/common/oauth2/token",
+    "API_KEY={file:~/.secret-store}",
+    "",
+  ].join("\n");
   const res = await run(["send", room2, "--stdin", "--as", "test-a"], { input: text });
   assert.equal(res.code, 0, res.stderr);
   const forced = await run(["send", room2, "AKIAABCDEFGHIJKLMNOP is a documented example", "--allow-secrets", "--as", "test-a"]);
@@ -213,7 +224,7 @@ test("placeholders and ordinary text pass the secret guard", live, async () => {
 test("send warns when nobody else is listening", live, async () => {
   const res = await run(["send", room2, "anyone there?", "--as", "test-a"]);
   assert.equal(res.code, 0, res.stderr);
-  assert.match(res.stdout, /nobody else is listening/);
+  assert.match(res.stdout, /no listener seen/);
 });
 
 test("only one wait per room and name; the lock is released afterwards", live, async () => {
@@ -223,11 +234,12 @@ test("only one wait per room and name; the lock is released afterwards", live, a
   const second = await run(["wait", room2, "--as", "test-lock", "--timeout", "2"]);
   assert.equal(second.code, 3, second.stdout + second.stderr);
   assert.match(second.stderr, /already running \(pid \d+/);
+  assert.match(second.stderr, /delete the lock: .*\.lock/);
 
   const who = await run(["who", room2, "--as", "test-a"]);
   assert.match(who.stdout, /^test-lock: listening/m);
   const send = await run(["send", room2, "wake up", "--as", "test-a"]);
-  assert.doesNotMatch(send.stdout, /nobody else is listening/);
+  assert.doesNotMatch(send.stdout, /no listener seen/);
 
   const done = await first;
   assert.equal(done.code, 0, done.stderr);
@@ -279,6 +291,24 @@ test("files are attached, listed without their contents, and fetched to disk", l
   assert.match(fetched.stdout, new RegExp(createHash("sha256").update(data).digest("hex")));
   assert.equal((await run(["fetch", room2, id, "--out", out, "--as", "test-files"])).code, 2);
   assert.equal((await run(["fetch", room2, id, "--out", out, "--force", "--as", "test-files"])).code, 0);
+});
+
+test("fetch falls back to a safe name when the attachment name is a path trap", live, async () => {
+  const server = process.env.AGENTCHAT_SERVER || "https://ntfy.amirasyraf.dev";
+  const url = new URL(`${server}/agentchat-${room2}`);
+  url.searchParams.set("filename", "..");
+  url.searchParams.set("title", "test-a");
+  url.searchParams.set("tags", "agentchat,agentchat-file");
+  const put = await fetch(url, { method: "PUT", headers: { Authorization: `Bearer ${token}` }, body: "trap" });
+  if (!put.ok) assert.fail(`PUT failed: ${await put.text()}`);
+  const id = (await put.json()).id;
+
+  const fetchDir = join(tmp, "fetch-trap");
+  mkdirSync(fetchDir, { recursive: true });
+  const res = await run(["fetch", room2, id, "--as", "test-files"], { cwd: fetchDir });
+  assert.equal(res.code, 0, res.stdout + res.stderr);
+  assert.match(res.stdout, new RegExp(`attachment-${id}`));
+  assert.equal(readFileSync(join(fetchDir, `attachment-${id}`), "utf8"), "trap");
 });
 
 test("history --last shows only the newest messages", live, async () => {

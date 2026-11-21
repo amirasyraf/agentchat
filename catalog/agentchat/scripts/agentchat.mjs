@@ -340,7 +340,8 @@ function acquireListenerLock(ctx, room) {
       if (holder?.pid && holder.pid !== process.pid && processAlive(holder.pid)) {
         throw new CliError(
           `another wait for room ${room} as ${ctx.name} is already running (pid ${holder.pid}, ` +
-            `started ${holder.started}). Only one listener per name: let it finish or stop it.`,
+            `started ${holder.started}). Only one listener per name: let it finish or stop it. If that pid no ` +
+            `longer belongs to agentchat (e.g. it was reused by an unrelated process), delete the lock: ${file}`,
           EXIT.listening,
         );
       }
@@ -386,6 +387,18 @@ async function heartbeat(ctx, room) {
 // Secret guard: refuse to relay anything that looks like a credential. Reports
 // which rule matched, never the matched value.
 const PLACEHOLDER_RE = /^(<[^>]*>|\*+|x+|\.\.\.|redacted|changeme|example|your[_-].*|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)$/i;
+// A captured value that names *where* a secret lives, rather than the secret
+// itself, is not a leak: a path, a plain URL, or a {file:...}/{env:...} reference.
+// A URL with userinfo (user:pass@) still carries a credential, so that is kept.
+const PATH_RE = /^(~|\.{1,2})?[\\/]|^[A-Za-z]:[\\/]/;
+const INTERP_RE = /^\{(?:file|env):[^}]+\}$/i;
+const URL_RE = /^https?:\/\//i;
+const URL_USERINFO_RE = /^https?:\/\/[^/\s@]+:[^/\s@]+@/i;
+
+function looksLikeLocation(value) {
+  if (PATH_RE.test(value) || INTERP_RE.test(value)) return true;
+  return URL_RE.test(value) && !URL_USERINFO_RE.test(value);
+}
 const SECRET_RULES = [
   ["private key block", /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/],
   ["AWS access key id", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
@@ -415,7 +428,7 @@ function findSecrets(ctx, text) {
     const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
     for (const match of text.matchAll(global)) {
       const value = group ? match[group] : match[0];
-      if (group && PLACEHOLDER_RE.test(value)) continue;
+      if (group && (PLACEHOLDER_RE.test(value) || looksLikeLocation(value))) continue;
       hits.push(`${label} on line ${lineOf(match.index)}`);
       break;
     }
@@ -525,8 +538,9 @@ async function cmdSend(ctx, room, words, opts) {
   const peers = await listeningPeers(ctx, room).catch(() => null);
   if (peers && !peers.length) {
     print(
-      `[agentchat] warning: nobody else is listening in room ${room} right now (no heartbeat in the last ` +
-        `${LISTENING_WINDOW_S}s). They will see the message when they next run wait. Check with: who ${room}`,
+      `[agentchat] note: no listener seen in room ${room} right now (no heartbeat in the last ` +
+        `${LISTENING_WINDOW_S}s). This is normal right after they finish a wait; they'll see this message on ` +
+        `their next wait. Check with: who ${room}`,
     );
   }
 }
@@ -626,7 +640,8 @@ async function cmdFetch(ctx, room, id, opts) {
   if (!msg.attachment) throw new CliError(`message ${id} has no attachment`, EXIT.usage);
   const { url, name, expires } = msg.attachment;
   if (expires && expires * 1000 < Date.now()) throw new CliError(`the attachment ${name} has expired on the server`);
-  const out = opts.out || basename(name);
+  const base = basename(name || "");
+  const out = opts.out || (base && base !== "." && base !== ".." ? base : `attachment-${msg.id}`);
   if (existsSync(out) && !opts.force) throw new CliError(`${out} already exists; use --force to overwrite`, EXIT.usage);
   const res = await fetch(url, { headers: attachmentHeaders(ctx, url) }).catch((err) => {
     throw new CliError(`cannot download ${name}: ${err.cause?.message ?? err.message}`);
