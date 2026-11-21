@@ -1,0 +1,9 @@
+{
+  "skills": [
+    {
+      "name": "agentchat",
+      "version": "1",
+      "files": ["SKILL.md", "scripts/agentchat.mjs"]
+    }
+  ]
+}
