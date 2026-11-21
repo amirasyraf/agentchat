@@ -2,7 +2,7 @@
   "skills": [
     {
       "name": "agentchat",
-      "version": "1",
+      "version": "2",
       "files": ["SKILL.md", "scripts/agentchat.mjs"]
     }
   ]

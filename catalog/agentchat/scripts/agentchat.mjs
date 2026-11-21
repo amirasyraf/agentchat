@@ -406,18 +406,21 @@ const SECRET_RULES = [
 ];
 
 function findSecrets(ctx, text) {
+  const lineOf = (index) => text.slice(0, index).split("\n").length;
   const hits = [];
-  if (ctx.token && ctx.token.length >= 8 && text.includes(ctx.token)) hits.push("this machine's ntfy token");
+  if (ctx.token && ctx.token.length >= 8 && text.includes(ctx.token)) {
+    hits.push(`this machine's ntfy token on line ${lineOf(text.indexOf(ctx.token))}`);
+  }
   for (const [label, re, group] of SECRET_RULES) {
     const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
     for (const match of text.matchAll(global)) {
       const value = group ? match[group] : match[0];
       if (group && PLACEHOLDER_RE.test(value)) continue;
-      hits.push(label);
+      hits.push(`${label} on line ${lineOf(match.index)}`);
       break;
     }
   }
-  return [...new Set(hits)];
+  return hits;
 }
 
 function guardOutgoing(ctx, text, label, opts) {

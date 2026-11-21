@@ -186,7 +186,7 @@ test("the secret guard refuses credentials without echoing them", async () => {
     ["key sk-ant-abcdefghijklmnopqrstuvwxyz0123", /sk- API key/],
     ["OPENAI_API_KEY=abcdefghijklmnopqrstuvwx", /credential assignment/],
     ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345", /Bearer credential/],
-    ["-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n", /private key block/],
+    ["header\n\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n", /private key block on line 3/],
     ["my token is tk_guardtesttokenguardtesttoken00", /this machine's ntfy token/],
   ];
   for (const [text, rule] of cases) {
